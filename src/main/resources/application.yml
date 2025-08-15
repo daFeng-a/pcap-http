@@ -1,6 +1,3 @@
-server:
-  port: 15510
-
 spring:
   application:
     name: pcap-test
