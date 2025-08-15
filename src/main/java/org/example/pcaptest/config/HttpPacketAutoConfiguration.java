@@ -6,14 +6,15 @@ import org.example.pcaptest.core.HttpPcapProcessor;
 import org.example.pcaptest.core.interceptor.PacketInterceptor;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
-
 import java.util.List;
 
 /**
  * http抓包自动配置类
  */
 @AutoConfiguration
+@EnableConfigurationProperties(HttpPcapConfig.class)
 @ConditionalOnProperty(prefix = "http.pacp", value = "enable", matchIfMissing = true)
 public class HttpPacketAutoConfiguration {
 
