@@ -12,6 +12,7 @@ import org.pcap4j.packet.TcpPacket;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentSkipListMap;
@@ -52,6 +53,25 @@ public class HttpPacketListener implements PacketListener {
         // 提取基础信息
         TcpPacket.TcpHeader tcpHeader = tcp.getHeader();
         byte[] payload = tcp.getPayload() != null ? tcp.getPayload().getRawData() : new byte[0];
+
+
+        // 尝试过滤只处理HTTP请求或响应
+        if (payload.length > 0) {
+            String payloadStr = new String(payload, StandardCharsets.US_ASCII);
+            // 只处理以常见HTTP方法或响应头开头的数据包
+            if (!(payloadStr.startsWith("GET ") ||
+                    payloadStr.startsWith("POST ") ||
+                    payloadStr.startsWith("PUT ") ||
+                    payloadStr.startsWith("DELETE ") ||
+                    payloadStr.startsWith("HEAD ") ||
+                    payloadStr.startsWith("OPTIONS ") ||
+                    payloadStr.startsWith("PATCH ") ||
+                    payloadStr.startsWith("HTTP/"))) {
+                // 非HTTP协议，直接return
+                return;
+            }
+        }
+
         String srcIp = ipV4.getHeader().getSrcAddr().getHostAddress();
         String dstIp = ipV4.getHeader().getDstAddr().getHostAddress();
         int srcPort = tcpHeader.getSrcPort().valueAsInt();
