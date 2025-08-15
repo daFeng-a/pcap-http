@@ -1,0 +1,8 @@
+spring:
+  application:
+    name: pcap-test
+
+http:
+  pacp:
+    enable: true
+    interface-index: 5
