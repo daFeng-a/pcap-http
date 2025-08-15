@@ -26,11 +26,14 @@ import java.util.zip.InflaterInputStream;
 public class HttpPacketListener implements PacketListener {
 
     // 存储HTTP响应流（线程安全，使用自定义StreamKey和ConcurrentSkipListMap）
-    private final Map<StreamKey, SortedMap<Long, byte[]>> httpResponseStreams = new ConcurrentHashMap<>();
+    private final Map<String, SortedMap<Long, byte[]>> httpResponseStreams = new ConcurrentHashMap<>();
     // 存储每个流的预期下一个序列号（线程安全）
-    private final Map<StreamKey, Long> streamExpectedSeq = new ConcurrentHashMap<>();
+    private final Map<String, Long> streamExpectedSeq = new ConcurrentHashMap<>();
     // 记录流最后活动时间（用于超时清理）
-    private final Map<StreamKey, Long> streamLastActiveTime = new ConcurrentHashMap<>();
+    private final Map<String, Long> streamLastActiveTime = new ConcurrentHashMap<>();
+    // 存储HTTP流的StreamKey
+    private final Set<String> httpStreams = ConcurrentHashMap.newKeySet();
+
     // 定时清理超时流的调度器
     private final ScheduledExecutorService scheduler;
 
@@ -52,25 +55,8 @@ public class HttpPacketListener implements PacketListener {
 
         // 提取基础信息
         TcpPacket.TcpHeader tcpHeader = tcp.getHeader();
-        byte[] payload = tcp.getPayload() != null ? tcp.getPayload().getRawData() : new byte[0];
 
 
-        // 尝试过滤只处理HTTP请求或响应
-        if (payload.length > 0) {
-            String payloadStr = new String(payload, StandardCharsets.US_ASCII);
-            // 只处理以常见HTTP方法或响应头开头的数据包
-            if (!(payloadStr.startsWith("GET ") ||
-                    payloadStr.startsWith("POST ") ||
-                    payloadStr.startsWith("PUT ") ||
-                    payloadStr.startsWith("DELETE ") ||
-                    payloadStr.startsWith("HEAD ") ||
-                    payloadStr.startsWith("OPTIONS ") ||
-                    payloadStr.startsWith("PATCH ") ||
-                    payloadStr.startsWith("HTTP/"))) {
-                // 非HTTP协议，直接return
-                return;
-            }
-        }
 
         String srcIp = ipV4.getHeader().getSrcAddr().getHostAddress();
         String dstIp = ipV4.getHeader().getDstAddr().getHostAddress();
@@ -79,7 +65,32 @@ public class HttpPacketListener implements PacketListener {
 
 
         // 生成流标识（使用自定义对象替代字符串拼接）
-        StreamKey streamKey = new StreamKey(srcIp, srcPort, dstIp, dstPort);
+        String streamKey = buildStreamKey(srcIp, srcPort, dstIp, dstPort);
+
+        byte[] payload = tcp.getPayload() != null ? tcp.getPayload().getRawData() : new byte[0];
+        // 只在新流第一个有payload的包做HTTP判断
+        if (!httpStreams.contains(streamKey)) {
+            if (payload.length > 0) {
+                String payloadStr = new String(payload, StandardCharsets.US_ASCII);
+                if (payloadStr.startsWith("GET ") ||
+                        payloadStr.startsWith("POST ") ||
+                        payloadStr.startsWith("HEAD ") ||
+                        payloadStr.startsWith("PUT ") ||
+                        payloadStr.startsWith("DELETE ") ||
+                        payloadStr.startsWith("OPTIONS ") ||
+                        payloadStr.startsWith("PATCH ") ||
+                        payloadStr.startsWith("HTTP/")) {
+                    httpStreams.add(streamKey); // 标记该流为HTTP
+                } else {
+                    // 非HTTP协议，直接return
+                    return;
+                }
+            } else {
+                // 第一次见到的包没payload，等后续包
+                return;
+            }
+        }
+
         long seq = tcpHeader.getSequenceNumber();
 
         // 处理拦截器
@@ -133,7 +144,7 @@ public class HttpPacketListener implements PacketListener {
     /**
      * 处理SYN包初始化逻辑
      */
-    private boolean handleSynPacket(StreamKey streamKey, TcpPacket.TcpHeader header, long seq) {
+    private boolean handleSynPacket(String streamKey, TcpPacket.TcpHeader header, long seq) {
         if (header.getSyn() && !header.getAck()) {
             streamExpectedSeq.put(streamKey, seq + 1);
             log.debug("[SYN] 新响应流初始化: {}", streamKey);
@@ -145,7 +156,7 @@ public class HttpPacketListener implements PacketListener {
     /**
      * 存储TCP数据包到流（使用支持序列号回绕的有序集合）
      */
-    private void storeTcpPacket(StreamKey streamKey, long seq, byte[] payload) {
+    private void storeTcpPacket(String streamKey, long seq, byte[] payload) {
         SortedMap<Long, byte[]> streamPackets = httpResponseStreams.computeIfAbsent(
                 streamKey, k -> new ConcurrentSkipListMap<>(new SequenceComparator())
         );
@@ -155,7 +166,7 @@ public class HttpPacketListener implements PacketListener {
     /**
      * 处理FIN包（重组并清理流）
      */
-    private void handleFinPacket(StreamKey streamKey, SimplePacketInfo info, Packet packet) {
+    private void handleFinPacket(String streamKey, SimplePacketInfo info, Packet packet) {
         HttpResponseData httpResponseData = saveCompleteResponse(streamKey);
         if (interceptors != null) {
             for (PacketInterceptor interceptor : interceptors) {
@@ -166,13 +177,14 @@ public class HttpPacketListener implements PacketListener {
         httpResponseStreams.remove(streamKey);
         streamExpectedSeq.remove(streamKey);
         streamLastActiveTime.remove(streamKey);
+        httpStreams.remove(streamKey);
         log.debug("[FIN] 流处理完成并清理: {}", streamKey);
     }
 
     /**
      * 更新预期的下一个序列号
      */
-    private void updateExpectedSequence(StreamKey streamKey, long currentSeq, int payloadLength) {
+    private void updateExpectedSequence(String streamKey, long currentSeq, int payloadLength) {
         Long expected = streamExpectedSeq.get(streamKey);
         if (expected != null && currentSeq == expected) {
             streamExpectedSeq.put(streamKey, currentSeq + payloadLength);
@@ -186,7 +198,7 @@ public class HttpPacketListener implements PacketListener {
         long timeoutMillis = 30_000; // 30秒超时
         long now = System.currentTimeMillis();
         streamLastActiveTime.entrySet().removeIf(entry -> {
-            StreamKey key = entry.getKey();
+            String key = entry.getKey();
             long lastActive = entry.getValue();
             if (now - lastActive > timeoutMillis) {
                 httpResponseStreams.remove(key);
@@ -201,7 +213,7 @@ public class HttpPacketListener implements PacketListener {
     /**
      * 重组并生成完整的HTTP响应
      */
-    private HttpResponseData saveCompleteResponse(StreamKey streamKey) {
+    private HttpResponseData saveCompleteResponse(String streamKey) {
         SortedMap<Long, byte[]> packets = httpResponseStreams.get(streamKey);
         if (packets == null || packets.isEmpty()) {
             log.info("[保存] 响应流无数据: {}", streamKey);
@@ -502,40 +514,9 @@ public class HttpPacketListener implements PacketListener {
         }
     }
 
-    /**
-     * 流唯一标识（替代字符串拼接，提升性能）
-     */
-    static class StreamKey {
-        private final String srcIp;
-        private final int srcPort;
-        private final String dstIp;
-        private final int dstPort;
 
-        public StreamKey(String srcIp, int srcPort, String dstIp, int dstPort) {
-            this.srcIp = srcIp;
-            this.srcPort = srcPort;
-            this.dstIp = dstIp;
-            this.dstPort = dstPort;
-        }
-
-        @Override
-        public boolean equals(Object o) {
-            if (this == o) return true;
-            if (o == null || getClass() != o.getClass()) return false;
-            StreamKey streamKey = (StreamKey) o;
-            return srcPort == streamKey.srcPort && dstPort == streamKey.dstPort &&
-                    Objects.equals(srcIp, streamKey.srcIp) && Objects.equals(dstIp, streamKey.dstIp);
-        }
-
-        @Override
-        public int hashCode() {
-            return Objects.hash(srcIp, srcPort, dstIp, dstPort);
-        }
-
-        @Override
-        public String toString() {
-            return srcIp + ":" + srcPort + "-" + dstIp + ":" + dstPort;
-        }
+    public String buildStreamKey(String srcIp, int srcPort, String dstIp, int dstPort){
+        return srcIp + ":" + srcPort + "-" + dstIp + ":" + dstPort;
     }
 
     /**

@@ -54,7 +54,7 @@ public class HttpPcapProcessor {
                 .build();
 
         // 设置过滤器：只捕获目标端口的TCP流量
-        String filter = "tcp";
+        String filter = "tcp port 8086";
         handle.setFilter(filter, BpfProgram.BpfCompileMode.OPTIMIZE);
         log.info("过滤器: {}", filter);
 
