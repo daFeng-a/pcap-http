@@ -195,7 +195,7 @@ public class HttpPacketListener implements PacketListener {
      * 清理超时无活动的流（防止内存泄漏）
      */
     private void cleanupExpiredStreams() {
-        long timeoutMillis = 30_000; // 30秒超时
+        long timeoutMillis = 5 * 60 * 1000; // 5分钟超时
         long now = System.currentTimeMillis();
         streamLastActiveTime.entrySet().removeIf(entry -> {
             String key = entry.getKey();

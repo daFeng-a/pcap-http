@@ -6,3 +6,7 @@ http:
   pacp:
     enable: true
     interface-index: 5
+
+logging:
+  level:
+    org.example.pcaptest: debug
