@@ -3,7 +3,7 @@ package org.example.pcaptest.core;
 import lombok.extern.slf4j.Slf4j;
 import org.example.pcaptest.core.entity.HttpResponseData;
 import org.example.pcaptest.core.entity.SimplePacketInfo;
-import org.example.pcaptest.core.interceptor.PacketInterceptor;
+import org.example.pcaptest.core.interceptor.HttpPacketInterceptor;
 import org.example.pcaptest.core.util.HttpHeaderUtils;
 import org.pcap4j.core.PacketListener;
 import org.pcap4j.packet.IpV4Packet;
@@ -38,9 +38,9 @@ public class HttpPacketListener implements PacketListener {
     // 定时清理超时流的调度器
     private final ScheduledExecutorService scheduler;
 
-    private final List<PacketInterceptor> interceptors;
+    private final List<HttpPacketInterceptor> interceptors;
 
-    public HttpPacketListener(List<PacketInterceptor> interceptors) {
+    public HttpPacketListener(List<HttpPacketInterceptor> interceptors) {
         this.interceptors = interceptors;
         this.scheduler = Executors.newSingleThreadScheduledExecutor();
         // 每10秒清理一次30秒无活动的流
@@ -143,7 +143,7 @@ public class HttpPacketListener implements PacketListener {
      */
     private boolean handleInterceptorsBefore(SimplePacketInfo info, Packet packet) {
         if (interceptors == null) return true;
-        for (PacketInterceptor interceptor : interceptors) {
+        for (HttpPacketInterceptor interceptor : interceptors) {
             if (!interceptor.beforeHandle(info, packet)) {
                 return false;
             }
@@ -564,7 +564,7 @@ public class HttpPacketListener implements PacketListener {
     private void handleCompleteResponse(String streamKey, SimplePacketInfo info, Packet packet) {
         HttpResponseData httpResponseData = saveCompleteResponse(streamKey);
         if (interceptors != null) {
-            for (PacketInterceptor interceptor : interceptors) {
+            for (HttpPacketInterceptor interceptor : interceptors) {
                 interceptor.afterHandle(httpResponseData, info, packet);
             }
         }
@@ -591,7 +591,7 @@ public class HttpPacketListener implements PacketListener {
         // 原有处理逻辑
         HttpResponseData httpResponseData = saveCompleteResponse(streamKey);
         if (interceptors != null) {
-            for (PacketInterceptor interceptor : interceptors) {
+            for (HttpPacketInterceptor interceptor : interceptors) {
                 interceptor.afterHandle(httpResponseData, info, packet);
             }
         }

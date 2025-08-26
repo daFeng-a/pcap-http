@@ -3,7 +3,7 @@ package org.example.pcaptest.config;
 import org.example.pcaptest.core.HttpPacketCommandLineRunner;
 import org.example.pcaptest.core.HttpPacketListener;
 import org.example.pcaptest.core.HttpPcapProcessor;
-import org.example.pcaptest.core.interceptor.PacketInterceptor;
+import org.example.pcaptest.core.interceptor.HttpPacketInterceptor;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
@@ -19,7 +19,7 @@ import java.util.List;
 public class HttpPacketAutoConfiguration {
 
     @Bean
-    public HttpPacketListener getHttpPacketListener(List<PacketInterceptor> interceptors) {
+    public HttpPacketListener getHttpPacketListener(List<HttpPacketInterceptor> interceptors) {
         return new HttpPacketListener(interceptors);
     }
 

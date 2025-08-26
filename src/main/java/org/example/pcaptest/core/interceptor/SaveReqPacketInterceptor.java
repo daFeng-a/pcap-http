@@ -15,7 +15,7 @@ import java.util.Date;
 
 @Slf4j
 @Component
-public class SaveReqPacketInterceptor implements PacketInterceptor{
+public class SaveReqPacketInterceptor implements HttpPacketInterceptor {
 
     // 时间格式化（用于生成唯一文件名）
     private static final SimpleDateFormat FILE_DATE_FORMAT = new SimpleDateFormat("yyyyMMdd_HHmmss_SSS");

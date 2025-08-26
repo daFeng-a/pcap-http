@@ -7,7 +7,7 @@ import org.pcap4j.packet.Packet;
 /**
  * 数据包包拦截器，返回false就不执行后续解析的代码了
  */
-public interface PacketInterceptor {
+public interface HttpPacketInterceptor {
 
     /**
      * 验证数据包是否需处理
