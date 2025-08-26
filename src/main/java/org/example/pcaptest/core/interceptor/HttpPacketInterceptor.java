@@ -1,5 +1,6 @@
 package org.example.pcaptest.core.interceptor;
 
+import org.example.pcaptest.core.entity.HttpRequestData;
 import org.example.pcaptest.core.entity.HttpResponseData;
 import org.example.pcaptest.core.entity.SimplePacketInfo;
 import org.pcap4j.packet.Packet;
@@ -19,13 +20,15 @@ public interface HttpPacketInterceptor {
         return true;
     }
 
+    void onRequestComplete(HttpRequestData requestData, SimplePacketInfo info, Packet packet);
+
     /**
      * 后置处理
      * @param httpResponseData
      * @param simplePacketInfo
      * @param packet
      */
-    void afterHandle(HttpResponseData httpResponseData, SimplePacketInfo simplePacketInfo, Packet packet);
+    void onResponseComplete(HttpResponseData httpResponseData, SimplePacketInfo simplePacketInfo, Packet packet);
 
 
 }

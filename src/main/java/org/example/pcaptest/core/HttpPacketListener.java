@@ -1,6 +1,7 @@
 package org.example.pcaptest.core;
 
 import lombok.extern.slf4j.Slf4j;
+import org.example.pcaptest.core.entity.HttpRequestData;
 import org.example.pcaptest.core.entity.HttpResponseData;
 import org.example.pcaptest.core.entity.SimplePacketInfo;
 import org.example.pcaptest.core.interceptor.HttpPacketInterceptor;
@@ -26,12 +27,19 @@ import java.util.zip.InflaterInputStream;
 @Slf4j
 public class HttpPacketListener implements PacketListener {
 
-    // 存储HTTP响应流（线程安全，使用自定义StreamKey和ConcurrentSkipListMap）
+    // 存储HTTP请求流（线程安全）
+    private final Map<String, SortedMap<Long, byte[]>> httpRequestStreams = new ConcurrentHashMap<>();
+    // 存储HTTP响应流（线程安全）
     private final Map<String, SortedMap<Long, byte[]>> httpResponseStreams = new ConcurrentHashMap<>();
+
     // 存储每个流的预期下一个序列号（线程安全）
-    private final Map<String, Long> streamExpectedSeq = new ConcurrentHashMap<>();
+    private final Map<String, Long> requestExpectedSeq = new ConcurrentHashMap<>();
+    private final Map<String, Long> responseExpectedSeq = new ConcurrentHashMap<>();
+
     // 记录流最后活动时间（用于超时清理）
-    private final Map<String, Long> streamLastActiveTime = new ConcurrentHashMap<>();
+    private final Map<String, Long> requestLastActiveTime = new ConcurrentHashMap<>();
+    private final Map<String, Long> responseLastActiveTime = new ConcurrentHashMap<>();
+
     // 存储HTTP流的StreamKey
     private final Set<String> httpStreams = ConcurrentHashMap.newKeySet();
 
@@ -49,39 +57,42 @@ public class HttpPacketListener implements PacketListener {
 
     @Override
     public void gotPacket(Packet packet) {
-        // 解析IP和TCP层（提取为独立方法，提升可读性）
+        // 解析IP和TCP层
         IpV4Packet ipV4 = packet.get(IpV4Packet.class);
         TcpPacket tcp = packet.get(TcpPacket.class);
         if (ipV4 == null || tcp == null) return;
 
         // 提取基础信息
         TcpPacket.TcpHeader tcpHeader = tcp.getHeader();
-
-
-
         String srcIp = ipV4.getHeader().getSrcAddr().getHostAddress();
         String dstIp = ipV4.getHeader().getDstAddr().getHostAddress();
         int srcPort = tcpHeader.getSrcPort().valueAsInt();
         int dstPort = tcpHeader.getDstPort().valueAsInt();
 
-
-        // 生成流标识（使用自定义对象替代字符串拼接）
+        // 生成流标识
         String streamKey = buildStreamKey(srcIp, srcPort, dstIp, dstPort);
+        String reverseStreamKey = buildStreamKey(dstIp, dstPort, srcIp, srcPort);
 
         byte[] payload = tcp.getPayload() != null ? tcp.getPayload().getRawData() : new byte[0];
+
         // 只在新流第一个有payload的包做HTTP判断
-        if (!httpStreams.contains(streamKey)) {
+        if (!httpStreams.contains(streamKey) && !httpStreams.contains(reverseStreamKey)) {
             if (payload.length > 0) {
                 String payloadStr = new String(payload, StandardCharsets.US_ASCII);
-                if (payloadStr.startsWith("GET ") ||
+                boolean isHttp = payloadStr.startsWith("GET ") ||
                         payloadStr.startsWith("POST ") ||
                         payloadStr.startsWith("HEAD ") ||
                         payloadStr.startsWith("PUT ") ||
                         payloadStr.startsWith("DELETE ") ||
                         payloadStr.startsWith("OPTIONS ") ||
                         payloadStr.startsWith("PATCH ") ||
-                        payloadStr.startsWith("HTTP/")) {
-                    httpStreams.add(streamKey); // 标记该流为HTTP
+                        payloadStr.startsWith("HTTP/");
+
+                if (isHttp) {
+                    // 标记双向流为HTTP
+                    httpStreams.add(streamKey);
+                    httpStreams.add(reverseStreamKey);
+                    log.info("[HTTP] 发现HTTP流: {} 和 {}", streamKey, reverseStreamKey);
                 } else {
                     // 非HTTP协议，直接return
                     return;
@@ -95,18 +106,16 @@ public class HttpPacketListener implements PacketListener {
         long seq = tcpHeader.getSequenceNumber();
 
         // 处理拦截器
-        SimplePacketInfo simplePacketInfo = new SimplePacketInfo(srcIp, srcPort, dstIp, dstPort,streamKey.toString());
+        SimplePacketInfo simplePacketInfo = new SimplePacketInfo(srcIp, srcPort, dstIp, dstPort, streamKey);
         if (!handleInterceptorsBefore(simplePacketInfo, packet)) {
             return;
         }
 
-
-
-        // 调试日志（降低级别，减少IO损耗）
-        log.debug("[包] 响应流: {}, SEQ={}, 负载长度={}, FIN={}",
+        // 调试日志
+        log.debug("[包] 流: {}, SEQ={}, 负载长度={}, FIN={}",
                 streamKey, seq, payload.length, tcpHeader.getFin());
 
-        // 处理SYN包（独立逻辑）
+        // 处理SYN包
         if (handleSynPacket(streamKey, tcpHeader, seq)) {
             return;
         }
@@ -114,28 +123,88 @@ public class HttpPacketListener implements PacketListener {
         // 忽略无负载且非FIN的包
         if (payload.length == 0 && !tcpHeader.getFin()) return;
 
-        // 存储数据包到流（使用线程安全的有序集合）
-        storeTcpPacket(streamKey, seq, payload);
+        // 判断是请求还是响应
+        boolean isRequest = isHttpRequest(payload) || httpRequestStreams.containsKey(streamKey);
+        boolean isResponse = isHttpResponse(payload) ||httpResponseStreams.containsKey(streamKey);
 
-        // 更新预期序列号
-        updateExpectedSequence(streamKey, seq, payload.length);
+        // 存储数据包到相应的流
+        if (isRequest) {
+            log.debug("[请求] 识别为HTTP请求: {}", streamKey);
+            storeTcpPacket(streamKey, seq, payload, true);
+            updateExpectedSequence(streamKey, seq, payload.length, true);
+            requestLastActiveTime.put(streamKey, System.currentTimeMillis());
 
-        // 更新最后活动时间
-        streamLastActiveTime.put(streamKey, System.currentTimeMillis());
-
-        // 检查HTTP响应是否已完成
-        SortedMap<Long, byte[]> packets = httpResponseStreams.get(streamKey);
-        if (packets != null && !packets.isEmpty()) {
-            byte[] reassembled = reassembleTcpStream(packets);
-            if (isHttpResponseComplete(reassembled)) {
-                handleCompleteResponse(streamKey, simplePacketInfo, packet);
+            // 检查HTTP请求是否已完成
+            SortedMap<Long, byte[]> packets = httpRequestStreams.get(streamKey);
+            if (packets != null && !packets.isEmpty()) {
+                byte[] reassembled = reassembleTcpStream(packets);
+                if (isHttpRequestComplete(reassembled)) {
+                    handleCompleteRequest(streamKey, simplePacketInfo, packet);
+                }
+            }
+        } else if (isResponse) {
+            log.debug("[响应] 识别为HTTP响应: {}", reverseStreamKey);
+            handleResponsePacket(reverseStreamKey,seq,payload,simplePacketInfo,packet);
+        } else {
+            // 无法确定是请求还是响应，尝试根据流状态判断
+            if (httpRequestStreams.containsKey(streamKey)) {
+                log.debug("[请求] 根据流状态识别为HTTP请求: {}", streamKey);
+                storeTcpPacket(streamKey, seq, payload, true);
+                updateExpectedSequence(streamKey, seq, payload.length, true);
+                requestLastActiveTime.put(streamKey, System.currentTimeMillis());
+            } else if (httpResponseStreams.containsKey(reverseStreamKey)) {
+                log.debug("[响应] 根据流状态识别为HTTP响应: {}", reverseStreamKey);
+                handleResponsePacket(reverseStreamKey,seq,payload,simplePacketInfo,packet);
+            } else {
+                log.debug("[未知] 无法识别包类型，但属于HTTP流: {}", streamKey);
             }
         }
 
         // 处理FIN包（流结束）
         if (tcpHeader.getFin()) {
-            handleFinPacket(streamKey, simplePacketInfo, packet);
+            if (isRequest) {
+                handleFinPacket(streamKey, simplePacketInfo, packet, true);
+            } else if (isResponse) {
+                handleFinPacket(reverseStreamKey, simplePacketInfo, packet, false);
+            } else {
+                // 尝试根据流状态判断FIN包类型
+                if (httpRequestStreams.containsKey(streamKey)) {
+                    handleFinPacket(streamKey, simplePacketInfo, packet, true);
+                } else if (httpResponseStreams.containsKey(reverseStreamKey)) {
+                    handleFinPacket(reverseStreamKey, simplePacketInfo, packet, false);
+                }
+            }
         }
+    }
+
+    private void handleResponsePacket(String reverseStreamKey,long seq,byte[] payload,SimplePacketInfo simplePacketInfo,Packet packet){
+        storeTcpPacket(reverseStreamKey, seq, payload, false);
+        updateExpectedSequence(reverseStreamKey, seq, payload.length, false);
+        responseLastActiveTime.put(reverseStreamKey, System.currentTimeMillis());
+
+        // 检查HTTP响应是否已完成
+        SortedMap<Long, byte[]> packets = httpResponseStreams.get(reverseStreamKey);
+        if (packets != null && !packets.isEmpty()) {
+            byte[] reassembled = reassembleTcpStream(packets);
+            if (isHttpResponseComplete(reassembled)) {
+                handleCompleteResponse(reverseStreamKey, simplePacketInfo, packet);
+            }
+        }
+    }
+
+    /**
+     * 判断是否为HTTP请求
+     */
+    private boolean isHttpRequest(byte[] payload) {
+        if (payload.length == 0) return false;
+        String payloadStr = new String(payload, StandardCharsets.US_ASCII);
+        return payloadStr.startsWith("GET ") ||
+                payloadStr.startsWith("POST ") ||
+                payloadStr.startsWith("HEAD ") ||
+                payloadStr.startsWith("PUT ") ||
+                payloadStr.startsWith("DELETE ") ||
+                payloadStr.startsWith("OPTIONS ") ||
+                payloadStr.startsWith("PATCH ");
     }
 
     /**
@@ -156,18 +225,20 @@ public class HttpPacketListener implements PacketListener {
      */
     private boolean handleSynPacket(String streamKey, TcpPacket.TcpHeader header, long seq) {
         if (header.getSyn() && !header.getAck()) {
-            streamExpectedSeq.put(streamKey, seq + 1);
-            log.debug("[SYN] 新响应流初始化: {}", streamKey);
+            requestExpectedSeq.put(streamKey, seq + 1);
+            responseExpectedSeq.put(streamKey, seq + 1);
+            log.debug("[SYN] 新流初始化: {}", streamKey);
             return true;
         }
         return false;
     }
 
     /**
-     * 存储TCP数据包到流（使用支持序列号回绕的有序集合）
+     * 存储TCP数据包到流
      */
-    private void storeTcpPacket(String streamKey, long seq, byte[] payload) {
-        SortedMap<Long, byte[]> streamPackets = httpResponseStreams.computeIfAbsent(
+    private void storeTcpPacket(String streamKey, long seq, byte[] payload, boolean isRequest) {
+        Map<String, SortedMap<Long, byte[]>> targetMap = isRequest ? httpRequestStreams : httpResponseStreams;
+        SortedMap<Long, byte[]> streamPackets = targetMap.computeIfAbsent(
                 streamKey, k -> new ConcurrentSkipListMap<>(new SequenceComparator())
         );
         streamPackets.put(seq, payload);
@@ -177,26 +248,42 @@ public class HttpPacketListener implements PacketListener {
     /**
      * 更新预期的下一个序列号
      */
-    private void updateExpectedSequence(String streamKey, long currentSeq, int payloadLength) {
-        Long expected = streamExpectedSeq.get(streamKey);
+    private void updateExpectedSequence(String streamKey, long currentSeq, int payloadLength, boolean isRequest) {
+        Map<String, Long> targetMap = isRequest ? requestExpectedSeq : responseExpectedSeq;
+        Long expected = targetMap.get(streamKey);
         if (expected != null && currentSeq == expected) {
-            streamExpectedSeq.put(streamKey, currentSeq + payloadLength);
+            targetMap.put(streamKey, currentSeq + payloadLength);
         }
     }
 
     /**
-     * 清理超时无活动的流（防止内存泄漏）
+     * 清理超时无活动的流
      */
     private void cleanupExpiredStreams() {
         long timeoutMillis = 5 * 60 * 1000; // 5分钟超时
         long now = System.currentTimeMillis();
-        streamLastActiveTime.entrySet().removeIf(entry -> {
+
+        // 清理请求流
+        requestLastActiveTime.entrySet().removeIf(entry -> {
+            String key = entry.getKey();
+            long lastActive = entry.getValue();
+            if (now - lastActive > timeoutMillis) {
+                httpRequestStreams.remove(key);
+                requestExpectedSeq.remove(key);
+                log.debug("[清理] 超时请求流: {}", key);
+                return true;
+            }
+            return false;
+        });
+
+        // 清理响应流
+        responseLastActiveTime.entrySet().removeIf(entry -> {
             String key = entry.getKey();
             long lastActive = entry.getValue();
             if (now - lastActive > timeoutMillis) {
                 httpResponseStreams.remove(key);
-                streamExpectedSeq.remove(key);
-                log.debug("[清理] 超时流: {}", key);
+                responseExpectedSeq.remove(key);
+                log.debug("[清理] 超时响应流: {}", key);
                 return true;
             }
             return false;
@@ -213,9 +300,9 @@ public class HttpPacketListener implements PacketListener {
             return null;
         }
 
-        // 1. 重组TCP流数据（处理重叠）
+        // 1. 重组TCP流数据
         byte[] fullResponse = reassembleTcpStream(packets);
-        log.info("[保存] 重组后总长度: {}字节", fullResponse.length);
+        log.info("[保存] 响应重组后总长度: {}字节", fullResponse.length);
 
         // 2. 分离HTTP头部和响应体
         int headerEndIndex = HttpHeaderUtils.findHttpHeaderEnd(fullResponse);
@@ -231,7 +318,7 @@ public class HttpPacketListener implements PacketListener {
 
         HttpResponseData responseData = new HttpResponseData(headerBytes);
 
-        // 3. 处理响应体编码（支持更多类型）
+        // 3. 处理响应体编码
         byte[] decodedBody = decodeResponseBody(bodyBytes, responseData.getHeaders());
         responseData.setBodyBytes(decodedBody);
 
@@ -309,7 +396,6 @@ public class HttpPacketListener implements PacketListener {
 
         return uActual - uExpected;
     }
-
 
     /**
      * 解码响应体（支持gzip、deflate、chunked）
@@ -513,6 +599,15 @@ public class HttpPacketListener implements PacketListener {
     }
 
     /**
+     * 判断是否为HTTP响应
+     */
+    private boolean isHttpResponse(byte[] payload) {
+        if (payload.length == 0) return false;
+        String payloadStr = new String(payload, StandardCharsets.US_ASCII);
+        return payloadStr.startsWith("HTTP/");
+    }
+
+    /**
      * 检查HTTP响应是否完整
      */
     private boolean isHttpResponseComplete(byte[] responseData) {
@@ -523,11 +618,13 @@ public class HttpPacketListener implements PacketListener {
         // 1. 查找头部结束位置
         int headerEndIndex = HttpHeaderUtils.findHttpHeaderEnd(responseData);
         if (headerEndIndex == -1) {
+            log.debug("[响应完成检查] 未找到完整HTTP头部");
             return false; // 没有完整头部
         }
 
         // 2. 解析头部
         Map<String, String> headers = HttpHeaderUtils.parseRespHeaders(responseData);
+        log.debug("[响应完成检查] 解析到的头部: {}", headers);
 
         // 3. 检查是否有Content-Length头
         String contentLengthStr = headers.get("content-length");
@@ -536,7 +633,11 @@ public class HttpPacketListener implements PacketListener {
                 int contentLength = Integer.parseInt(contentLengthStr);
                 int bodyStartIndex = headerEndIndex + 4; // \r\n\r\n之后是body开始
                 if (responseData.length >= bodyStartIndex + contentLength) {
+                    log.info("[响应完成检查] 基于Content-Length判断响应完成: {}字节", contentLength);
                     return true; // 已收到完整body
+                } else {
+                    log.debug("[响应完成检查] 响应体不完整: 期望{}字节，实际{}字节",
+                            contentLength, responseData.length - bodyStartIndex);
                 }
             } catch (NumberFormatException e) {
                 log.warn("无效的Content-Length: {}", contentLengthStr);
@@ -547,15 +648,135 @@ public class HttpPacketListener implements PacketListener {
         String transferEncoding = headers.get("transfer-encoding");
         if (transferEncoding != null && transferEncoding.equalsIgnoreCase("chunked")) {
             // 检查分块编码是否结束（以0\r\n\r\n结尾）
-            if (responseData.length >= 5) {
-                String tail = new String(Arrays.copyOfRange(responseData, responseData.length - 5, responseData.length),
-                        StandardCharsets.US_ASCII);
-                return tail.endsWith("0\r\n\r\n") || tail.endsWith("0\n\n");
+            String responseStr = new String(responseData, StandardCharsets.US_ASCII);
+            if (responseStr.contains("0\r\n\r\n") || responseStr.endsWith("0\n\n")) {
+                log.info("[响应完成检查] 基于分块编码判断响应完成");
+                return true;
+            } else {
+                log.debug("[响应完成检查] 分块编码响应未完成");
             }
         }
 
         // 5. 如果没有Content-Length也不是分块编码，则根据连接关闭判断，需要等待FIN
+        log.debug("[响应完成检查] 响应未完成，需要等待FIN包");
         return false;
+    }
+
+
+
+    /**
+     * 处理FIN包(TCP连接关闭)
+     */
+    private void handleFinPacket(String streamKey, SimplePacketInfo info, Packet packet, boolean isRequest) {
+        if (isRequest) {
+            // 处理请求流结束
+            HttpRequestData httpRequestData = saveCompleteRequest(streamKey);
+            if (interceptors != null) {
+                for (HttpPacketInterceptor interceptor : interceptors) {
+                    interceptor.onRequestComplete(httpRequestData, info, packet);
+                }
+            }
+            // 清理请求流数据
+            httpRequestStreams.remove(streamKey);
+            requestExpectedSeq.remove(streamKey);
+            requestLastActiveTime.remove(streamKey);
+        } else {
+            // 处理响应流结束
+            HttpResponseData httpResponseData = saveCompleteResponse(streamKey);
+            if (interceptors != null) {
+                for (HttpPacketInterceptor interceptor : interceptors) {
+                    interceptor.onResponseComplete(httpResponseData, info, packet);
+                }
+            }
+            // 清理响应流数据
+            httpResponseStreams.remove(streamKey);
+            responseExpectedSeq.remove(streamKey);
+            responseLastActiveTime.remove(streamKey);
+        }
+        log.debug("[FIN] 流处理完成并清理: {}", streamKey);
+    }
+    /**
+     * 重组并生成完整的HTTP请求
+     */
+    private HttpRequestData saveCompleteRequest(String streamKey) {
+        SortedMap<Long, byte[]> packets = httpRequestStreams.get(streamKey);
+        if (packets == null || packets.isEmpty()) {
+            log.info("[保存] 请求流无数据: {}", streamKey);
+            return null;
+        }
+
+        // 1. 重组TCP流数据
+        byte[] fullRequest = reassembleTcpStream(packets);
+        log.info("[保存] 请求重组后总长度: {}字节", fullRequest.length);
+
+        // 2. 分离HTTP头部和请求体
+        int headerEndIndex = HttpHeaderUtils.findHttpHeaderEnd(fullRequest);
+        byte[] headerBytes = new byte[0];
+        byte[] bodyBytes = fullRequest;
+
+        if (headerEndIndex != -1) {
+            headerBytes = Arrays.copyOfRange(fullRequest, 0, headerEndIndex);
+            bodyBytes = Arrays.copyOfRange(fullRequest, headerEndIndex + 4, fullRequest.length);
+        } else {
+            log.warn("[保存] 未找到完整HTTP头部，保存全部数据");
+        }
+
+        HttpRequestData requestData = new HttpRequestData(headerBytes);
+
+        // 3. 处理请求体
+        requestData.setBodyBytes(bodyBytes);
+
+        return requestData;
+    }
+
+    /**
+     * 检查HTTP请求是否完整
+     */
+    private boolean isHttpRequestComplete(byte[] requestData) {
+        if (requestData == null || requestData.length == 0) {
+            return false;
+        }
+
+        // 1. 查找头部结束位置
+        int headerEndIndex = HttpHeaderUtils.findHttpHeaderEnd(requestData);
+        if (headerEndIndex == -1) {
+            return false; // 没有完整头部
+        }
+
+        // 2. 解析头部
+        Map<String, String> headers = HttpHeaderUtils.parseReqHeaders(requestData);
+
+        // 3. 检查是否有Content-Length头
+        String contentLengthStr = headers.get("content-length");
+        if (contentLengthStr != null) {
+            try {
+                int contentLength = Integer.parseInt(contentLengthStr);
+                int bodyStartIndex = headerEndIndex + 4; // \r\n\r\n之后是body开始
+                if (requestData.length >= bodyStartIndex + contentLength) {
+                    return true; // 已收到完整body
+                }
+            } catch (NumberFormatException e) {
+                log.warn("无效的Content-Length: {}", contentLengthStr);
+            }
+        } else {
+            // 对于没有Content-Length的请求（如GET），头部结束即为完整
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * 处理完整的HTTP请求
+     */
+    private void handleCompleteRequest(String streamKey, SimplePacketInfo info, Packet packet) {
+        HttpRequestData httpRequestData = saveCompleteRequest(streamKey);
+        if (interceptors != null) {
+            for (HttpPacketInterceptor interceptor : interceptors) {
+                interceptor.onRequestComplete(httpRequestData, info, packet);
+            }
+        }
+        log.debug("[HTTP] 请求已完成并处理: {}", streamKey);
     }
 
     /**
@@ -565,41 +786,9 @@ public class HttpPacketListener implements PacketListener {
         HttpResponseData httpResponseData = saveCompleteResponse(streamKey);
         if (interceptors != null) {
             for (HttpPacketInterceptor interceptor : interceptors) {
-                interceptor.afterHandle(httpResponseData, info, packet);
+                interceptor.onResponseComplete(httpResponseData, info, packet);
             }
         }
-        // 标记流为已完成，但不立即清理，等待FIN包进行最终清理
-        httpStreams.remove(streamKey + "_active"); // 使用特殊标记表示响应已完成
         log.debug("[HTTP] 响应已完成并处理: {}", streamKey);
-    }
-
-    /**
-     * 处理FIN包(TCP连接关闭)
-     */
-    private void handleFinPacket(String streamKey, SimplePacketInfo info, Packet packet) {
-        // 如果响应已经处理过，只进行清理
-        if (!httpStreams.contains(streamKey + "_active")) {
-            log.debug("[FIN] 流已完成响应处理，仅进行清理: {}", streamKey);
-            // 清理流数据
-            httpResponseStreams.remove(streamKey);
-            streamExpectedSeq.remove(streamKey);
-            streamLastActiveTime.remove(streamKey);
-            httpStreams.remove(streamKey);
-            return;
-        }
-
-        // 原有处理逻辑
-        HttpResponseData httpResponseData = saveCompleteResponse(streamKey);
-        if (interceptors != null) {
-            for (HttpPacketInterceptor interceptor : interceptors) {
-                interceptor.afterHandle(httpResponseData, info, packet);
-            }
-        }
-        // 清理流数据
-        httpResponseStreams.remove(streamKey);
-        streamExpectedSeq.remove(streamKey);
-        streamLastActiveTime.remove(streamKey);
-        httpStreams.remove(streamKey);
-        log.debug("[FIN] 流处理完成并清理: {}", streamKey);
     }
 }

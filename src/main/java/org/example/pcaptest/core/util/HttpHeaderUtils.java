@@ -11,6 +11,46 @@ import java.util.Map;
 public class HttpHeaderUtils {
 
     /**
+     * 解析HTTP请求头字节数组，提取键值对
+     * @param headerBytes HTTP请求头的字节数组
+     * @return 包含请求头键值对的Map
+     */
+    public static Map<String, String> parseReqHeaders(byte[] headerBytes) {
+        Map<String, String> headers = new HashMap<>();
+
+        if (headerBytes == null || headerBytes.length == 0) {
+            return headers;
+        }
+
+        // 将字节数组转换为字符串，使用UTF-8编码
+        String headerStr = new String(headerBytes, StandardCharsets.UTF_8);
+
+        // 按行分割，Windows和Linux的换行符都要考虑
+        String[] lines = headerStr.split("\r?\n");
+
+        // 跳过第一行（请求行，如：GET /index.html HTTP/1.1）
+        for (int i = 1; i < lines.length; i++) {
+            String line = lines[i].trim();
+
+            // 空行表示头部结束
+            if (line.isEmpty()) {
+                break;
+            }
+
+            // 分割键和值（只分割第一个冒号）
+            int colonIndex = line.indexOf(':');
+            if (colonIndex != -1) {
+                String key = line.substring(0, colonIndex).trim();
+                String value = line.substring(colonIndex + 1).trim();
+                headers.put(key, value);
+            }
+        }
+
+        return headers;
+    }
+
+
+    /**
      * 从HTTP响应原始数据中解析头部键值对（仅解析首行和 headers）
      * @param fullResponse 重组后的HTTP响应原始字节
      * @return 头部键值对（键：小写，值：原始值）

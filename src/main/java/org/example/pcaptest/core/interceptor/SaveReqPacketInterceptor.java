@@ -1,6 +1,7 @@
 package org.example.pcaptest.core.interceptor;
 
 import lombok.extern.slf4j.Slf4j;
+import org.example.pcaptest.core.entity.HttpRequestData;
 import org.example.pcaptest.core.entity.HttpResponseData;
 import org.example.pcaptest.core.entity.SimplePacketInfo;
 import org.pcap4j.packet.Packet;
@@ -29,7 +30,17 @@ public class SaveReqPacketInterceptor implements HttpPacketInterceptor {
     }
 
     @Override
-    public void afterHandle(HttpResponseData httpResponseData, SimplePacketInfo simplePacketInfo, Packet packet) {
+    public void onRequestComplete(HttpRequestData requestData, SimplePacketInfo info, Packet packet) {
+        // 4. 生成唯一文件名（流标识+时间戳）
+        String timestamp = FILE_DATE_FORMAT.format(new Date());
+        String fileName = SAVE_DIR + "request_" + info.getStreamKey().replace(":", "_") + "_" + timestamp;
+
+        // 5. 保存头部（可选，方便调试）
+        saveToFile(requestData.getHeaderBytes(), fileName + ".txt");
+    }
+
+    @Override
+    public void onResponseComplete(HttpResponseData httpResponseData, SimplePacketInfo simplePacketInfo, Packet packet) {
         // 4. 生成唯一文件名（流标识+时间戳）
         String timestamp = FILE_DATE_FORMAT.format(new Date());
         String fileName = SAVE_DIR + "response_" + simplePacketInfo.getStreamKey().replace(":", "_") + "_" + timestamp;
