@@ -40,6 +40,10 @@ public class HttpPacketListener implements PacketListener {
     private final Map<String, Long> requestLastActiveTime = new ConcurrentHashMap<>();
     private final Map<String, Long> responseLastActiveTime = new ConcurrentHashMap<>();
 
+    // 流的预期总长度和当前已接收长度
+    private final Map<String, Integer> responseExpectedLength = new ConcurrentHashMap<>();
+    private final Map<String, Integer> responseCurrentLength = new ConcurrentHashMap<>();
+
     // 存储HTTP流的StreamKey
     private final Set<String> httpStreams = ConcurrentHashMap.newKeySet();
 
@@ -124,8 +128,8 @@ public class HttpPacketListener implements PacketListener {
         if (payload.length == 0 && !tcpHeader.getFin()) return;
 
         // 判断是请求还是响应
-        boolean isRequest = isHttpRequest(payload) || httpRequestStreams.containsKey(streamKey);
-        boolean isResponse = isHttpResponse(payload) ||httpResponseStreams.containsKey(streamKey);
+        boolean isRequest = isHttpRequest(payload);
+        boolean isResponse = isHttpResponse(payload);
 
         // 存储数据包到相应的流
         if (isRequest) {
@@ -177,17 +181,98 @@ public class HttpPacketListener implements PacketListener {
         }
     }
 
-    private void handleResponsePacket(String reverseStreamKey,long seq,byte[] payload,SimplePacketInfo simplePacketInfo,Packet packet){
+    private void handleResponsePacket(String reverseStreamKey, long seq, byte[] payload, SimplePacketInfo simplePacketInfo, Packet packet) {
         storeTcpPacket(reverseStreamKey, seq, payload, false);
         updateExpectedSequence(reverseStreamKey, seq, payload.length, false);
         responseLastActiveTime.put(reverseStreamKey, System.currentTimeMillis());
 
-        // 检查HTTP响应是否已完成
+        // 获取当前流的包集合
         SortedMap<Long, byte[]> packets = httpResponseStreams.get(reverseStreamKey);
-        if (packets != null && !packets.isEmpty()) {
+        if (packets == null || packets.isEmpty()) return;
+
+        // 检查是否为分块编码且未完成
+        if (responseExpectedLength.containsKey(reverseStreamKey) &&
+                responseExpectedLength.get(reverseStreamKey) == -1) {
+
+            // 检查最后几个包是否包含分块结束标记
+            if (hasChunkedEndMarker(packets)) {
+                log.debug("[分块] 检测到结束标记，尝试完成响应: {}", reverseStreamKey);
+                byte[] reassembled = reassembleTcpStream(packets);
+                if (isHttpResponseComplete(reassembled)) {
+                    handleCompleteResponse(reverseStreamKey, simplePacketInfo, packet);
+                }
+                return;
+            }
+        }
+
+
+        // 仅在未缓存头部信息时尝试解析
+        if (!responseExpectedLength.containsKey(reverseStreamKey)) {
             byte[] reassembled = reassembleTcpStream(packets);
             if (isHttpResponseComplete(reassembled)) {
                 handleCompleteResponse(reverseStreamKey, simplePacketInfo, packet);
+            } else {
+                // 尝试解析头部以获取Content-Length
+                int headerEndIndex = HttpHeaderUtils.findHttpHeaderEnd(reassembled);
+                if (headerEndIndex != -1) {
+                    Map<String, String> headers = HttpHeaderUtils.parseRespHeaders(reassembled);
+                    String contentLengthStr = headers.get("content-length");
+                    if (contentLengthStr != null) {
+                        try {
+                            int contentLength = Integer.parseInt(contentLengthStr);
+                            int totalLength = headerEndIndex + 4 + contentLength;
+                            responseExpectedLength.put(reverseStreamKey, totalLength);
+                            responseCurrentLength.put(reverseStreamKey, reassembled.length);
+                        } catch (NumberFormatException e) {
+                            log.warn("Invalid Content-Length: {}", contentLengthStr);
+                        }
+                    } else if (headers.containsKey("transfer-encoding")) {
+                        // 分块编码，无法简单通过长度判断，仍需重组检查
+                        responseExpectedLength.put(reverseStreamKey, -1);
+                    }
+                }
+            }
+        } else {
+            // 已缓存头部信息，更新当前长度并检查
+            Integer currentLenObj = responseCurrentLength.get(reverseStreamKey);
+            if (currentLenObj != null) {
+                int currentLen = currentLenObj + payload.length;
+                responseCurrentLength.put(reverseStreamKey, currentLen);
+                Integer expectedLenObj = responseExpectedLength.get(reverseStreamKey);
+
+                if (expectedLenObj != null) {
+                    int expectedLen = expectedLenObj;
+                    if (expectedLen != -1 && currentLen >= expectedLen) {
+                        byte[] reassembled = reassembleTcpStream(packets);
+                        if (isHttpResponseComplete(reassembled)) {
+                            handleCompleteResponse(reverseStreamKey, simplePacketInfo, packet);
+                        }
+                    }
+                }
+            } else {
+                // 如果没有找到当前长度记录，可能需要重新初始化
+                log.debug("[响应] 未找到流的当前长度记录，尝试重新初始化: {}", reverseStreamKey);
+                // 重新尝试解析头部信息
+                byte[] reassembled = reassembleTcpStream(packets);
+                int headerEndIndex = HttpHeaderUtils.findHttpHeaderEnd(reassembled);
+                if (headerEndIndex != -1) {
+                    Map<String, String> headers = HttpHeaderUtils.parseRespHeaders(reassembled);
+                    String contentLengthStr = headers.get("content-length");
+                    if (contentLengthStr != null) {
+                        try {
+                            int contentLength = Integer.parseInt(contentLengthStr);
+                            int totalLength = headerEndIndex + 4 + contentLength;
+                            responseExpectedLength.put(reverseStreamKey, totalLength);
+                            responseCurrentLength.put(reverseStreamKey, reassembled.length);
+                        } catch (NumberFormatException e) {
+                            log.warn("无效的Content-Length: {}", contentLengthStr);
+                        }
+                    } else if (headers.containsKey("transfer-encoding")) {
+                        // 分块编码，无法简单通过长度判断，仍需重组检查
+                        responseExpectedLength.put(reverseStreamKey, -1);
+                        responseCurrentLength.put(reverseStreamKey, reassembled.length);
+                    }
+                }
             }
         }
     }
@@ -680,18 +765,35 @@ public class HttpPacketListener implements PacketListener {
             httpRequestStreams.remove(streamKey);
             requestExpectedSeq.remove(streamKey);
             requestLastActiveTime.remove(streamKey);
+
+            // 清理响应相关的缓存（如果存在）
+            responseExpectedLength.remove(streamKey);
+            responseCurrentLength.remove(streamKey);
         } else {
-            // 处理响应流结束
-            HttpResponseData httpResponseData = saveCompleteResponse(streamKey);
-            if (interceptors != null) {
-                for (HttpPacketInterceptor interceptor : interceptors) {
-                    interceptor.onResponseComplete(httpResponseData, info, packet);
+            // 处理响应流结束 - 强制检查响应完整性
+            SortedMap<Long, byte[]> packets = httpResponseStreams.get(streamKey);
+            if (packets != null && !packets.isEmpty()) {
+                byte[] reassembled = reassembleTcpStream(packets);
+                if (isHttpResponseComplete(reassembled)) {
+                    HttpResponseData httpResponseData = saveCompleteResponse(streamKey);
+                    if (interceptors != null) {
+                        for (HttpPacketInterceptor interceptor : interceptors) {
+                            interceptor.onResponseComplete(httpResponseData, info, packet);
+                        }
+                    }
+                } else {
+                    log.warn("[FIN] 响应流结束但数据不完整: {}", streamKey);
                 }
             }
+
             // 清理响应流数据
             httpResponseStreams.remove(streamKey);
             responseExpectedSeq.remove(streamKey);
             responseLastActiveTime.remove(streamKey);
+
+            // 清理响应相关的缓存
+            responseExpectedLength.remove(streamKey);
+            responseCurrentLength.remove(streamKey);
         }
         log.debug("[FIN] 流处理完成并清理: {}", streamKey);
     }
@@ -790,5 +892,77 @@ public class HttpPacketListener implements PacketListener {
             }
         }
         log.debug("[HTTP] 响应已完成并处理: {}", streamKey);
+    }
+
+    // 新增方法：检查最后几个包是否包含分块结束标记
+    private boolean hasChunkedEndMarker(SortedMap<Long, byte[]> packets) {
+        if (packets.isEmpty()) return false;
+
+        // 获取最后几个包（例如最后5个）
+        List<byte[]> lastPackets = new ArrayList<>();
+        int maxPacketsToCheck = 5;
+
+        try {
+            // 从最后一个包开始向前检查
+            Long lastKey = packets.lastKey();
+            int count = 0;
+
+            // 创建一个包含最后几个键的子集
+            SortedMap<Long, byte[]> tailMap = packets;
+            while (count < maxPacketsToCheck && !tailMap.isEmpty()) {
+                Long key = tailMap.lastKey();
+                lastPackets.add(tailMap.get(key));
+
+                // 获取前面的键
+                if (tailMap.headMap(key).isEmpty()) {
+                    break;
+                }
+                tailMap = tailMap.headMap(key);
+                count++;
+            }
+        } catch (Exception e) {
+            log.warn("检查分块结束标记时出错: {}", e.getMessage());
+            return false;
+        }
+
+        // 检查这些包中是否包含分块结束标记
+        for (byte[] packetData : lastPackets) {
+            String dataStr = new String(packetData, StandardCharsets.US_ASCII);
+            if (dataStr.contains("0\r\n\r\n") || dataStr.endsWith("0\n\n")) {
+                return true;
+            }
+        }
+
+        // 检查跨包的情况：结束标记可能被分割在两个包中
+        if (lastPackets.size() >= 2) {
+            // 检查相邻两个包的结合处
+            for (int i = 0; i < lastPackets.size() - 1; i++) {
+                byte[] first = lastPackets.get(i);
+                byte[] second = lastPackets.get(i + 1);
+
+                // 检查第一个包的结尾和第二个包的开头组合是否形成结束标记
+                int checkLength = 10; // 检查足够的长度以覆盖可能的分割
+                if (first.length > 0 && second.length > 0) {
+                    int endLength = Math.min(checkLength, first.length);
+                    int startLength = Math.min(checkLength, second.length);
+
+                    String endOfFirst = new String(
+                            Arrays.copyOfRange(first, first.length - endLength, first.length),
+                            StandardCharsets.US_ASCII
+                    );
+                    String startOfSecond = new String(
+                            Arrays.copyOfRange(second, 0, startLength),
+                            StandardCharsets.US_ASCII
+                    );
+
+                    String combined = endOfFirst + startOfSecond;
+                    if (combined.contains("0\r\n\r\n") || combined.contains("0\n\n")) {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        return false;
     }
 }
