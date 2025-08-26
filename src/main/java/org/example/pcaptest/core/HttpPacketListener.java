@@ -4,6 +4,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.example.pcaptest.core.entity.HttpResponseData;
 import org.example.pcaptest.core.entity.SimplePacketInfo;
 import org.example.pcaptest.core.interceptor.PacketInterceptor;
+import org.example.pcaptest.core.util.HttpHeaderUtils;
 import org.pcap4j.core.PacketListener;
 import org.pcap4j.packet.IpV4Packet;
 import org.pcap4j.packet.Packet;
@@ -122,6 +123,15 @@ public class HttpPacketListener implements PacketListener {
         // 更新最后活动时间
         streamLastActiveTime.put(streamKey, System.currentTimeMillis());
 
+        // 检查HTTP响应是否已完成
+        SortedMap<Long, byte[]> packets = httpResponseStreams.get(streamKey);
+        if (packets != null && !packets.isEmpty()) {
+            byte[] reassembled = reassembleTcpStream(packets);
+            if (isHttpResponseComplete(reassembled)) {
+                handleCompleteResponse(streamKey, simplePacketInfo, packet);
+            }
+        }
+
         // 处理FIN包（流结束）
         if (tcpHeader.getFin()) {
             handleFinPacket(streamKey, simplePacketInfo, packet);
@@ -164,9 +174,21 @@ public class HttpPacketListener implements PacketListener {
     }
 
     /**
-     * 处理FIN包（重组并清理流）
+     * 处理FIN包(TCP连接关闭)
      */
     private void handleFinPacket(String streamKey, SimplePacketInfo info, Packet packet) {
+        // 如果响应已经处理过，只进行清理
+        if (!httpStreams.contains(streamKey + "_active")) {
+            log.debug("[FIN] 流已完成响应处理，仅进行清理: {}", streamKey);
+            // 清理流数据
+            httpResponseStreams.remove(streamKey);
+            streamExpectedSeq.remove(streamKey);
+            streamLastActiveTime.remove(streamKey);
+            httpStreams.remove(streamKey);
+            return;
+        }
+
+        // 原有处理逻辑
         HttpResponseData httpResponseData = saveCompleteResponse(streamKey);
         if (interceptors != null) {
             for (PacketInterceptor interceptor : interceptors) {
@@ -225,7 +247,7 @@ public class HttpPacketListener implements PacketListener {
         log.info("[保存] 重组后总长度: {}字节", fullResponse.length);
 
         // 2. 分离HTTP头部和响应体
-        int headerEndIndex = findHttpHeaderEnd(fullResponse);
+        int headerEndIndex = HttpHeaderUtils.findHttpHeaderEnd(fullResponse);
         byte[] headerBytes = new byte[0];
         byte[] bodyBytes = fullResponse;
 
@@ -317,25 +339,7 @@ public class HttpPacketListener implements PacketListener {
         return uActual - uExpected;
     }
 
-    /**
-     * 查找HTTP头部结束位置（严格匹配\r\n\r\n）
-     */
-    private static int findHttpHeaderEnd(byte[] data) {
-        for (int i = 0; i < data.length - 3; i++) {
-            if (data[i] == '\r' && data[i + 1] == '\n' &&
-                    data[i + 2] == '\r' && data[i + 3] == '\n') {
-                return i;
-            }
-        }
-        // 容错：尝试寻找\n\n作为结束标志（非标准）
-        for (int i = 0; i < data.length - 1; i++) {
-            if (data[i] == '\n' && data[i + 1] == '\n') {
-                log.info("[头部] 发现非标准结束标志\\n\\n");
-                return i;
-            }
-        }
-        return -1;
-    }
+
 
     /**
      * 解码响应体（支持gzip、deflate、chunked）
@@ -536,5 +540,66 @@ public class HttpPacketListener implements PacketListener {
 
             return Long.compare(uSeq1, uSeq2);
         }
+    }
+
+    /**
+     * 检查HTTP响应是否完整
+     */
+    private boolean isHttpResponseComplete(byte[] responseData) {
+        if (responseData == null || responseData.length == 0) {
+            return false;
+        }
+
+        // 1. 查找头部结束位置
+        int headerEndIndex = HttpHeaderUtils.findHttpHeaderEnd(responseData);
+        if (headerEndIndex == -1) {
+            return false; // 没有完整头部
+        }
+
+        // 2. 解析头部
+        Map<String, String> headers = HttpHeaderUtils.parseRespHeaders(responseData);
+
+        // 3. 检查是否有Content-Length头
+        String contentLengthStr = headers.get("content-length");
+        if (contentLengthStr != null) {
+            try {
+                int contentLength = Integer.parseInt(contentLengthStr);
+                int bodyStartIndex = headerEndIndex + 4; // \r\n\r\n之后是body开始
+                if (responseData.length >= bodyStartIndex + contentLength) {
+                    return true; // 已收到完整body
+                }
+            } catch (NumberFormatException e) {
+                log.warn("无效的Content-Length: {}", contentLengthStr);
+            }
+        }
+
+        // 4. 检查是否是分块编码
+        String transferEncoding = headers.get("transfer-encoding");
+        if (transferEncoding != null && transferEncoding.equalsIgnoreCase("chunked")) {
+            // 检查分块编码是否结束（以0\r\n\r\n结尾）
+            if (responseData.length >= 5) {
+                String tail = new String(Arrays.copyOfRange(responseData, responseData.length - 5, responseData.length),
+                        StandardCharsets.US_ASCII);
+                return tail.endsWith("0\r\n\r\n") || tail.endsWith("0\n\n");
+            }
+        }
+
+        // 5. 如果没有Content-Length也不是分块编码，则根据连接关闭判断，需要等待FIN
+        return false;
+    }
+
+    /**
+     * 处理完整的HTTP响应
+     */
+    private void handleCompleteResponse(String streamKey, SimplePacketInfo info, Packet packet) {
+        HttpResponseData httpResponseData = saveCompleteResponse(streamKey);
+        if (interceptors != null) {
+            for (PacketInterceptor interceptor : interceptors) {
+                interceptor.afterHandle(httpResponseData, info, packet);
+            }
+        }
+        // 标记流为已完成，但不立即清理，等待FIN包进行最终清理
+        httpStreams.remove(streamKey + "_active"); // 使用特殊标记表示响应已完成
+        log.debug("[HTTP] 响应已完成并处理: {}", streamKey);
     }
 }
