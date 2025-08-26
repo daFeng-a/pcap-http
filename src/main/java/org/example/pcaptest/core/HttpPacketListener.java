@@ -173,35 +173,6 @@ public class HttpPacketListener implements PacketListener {
         streamPackets.put(seq, payload);
     }
 
-    /**
-     * 处理FIN包(TCP连接关闭)
-     */
-    private void handleFinPacket(String streamKey, SimplePacketInfo info, Packet packet) {
-        // 如果响应已经处理过，只进行清理
-        if (!httpStreams.contains(streamKey + "_active")) {
-            log.debug("[FIN] 流已完成响应处理，仅进行清理: {}", streamKey);
-            // 清理流数据
-            httpResponseStreams.remove(streamKey);
-            streamExpectedSeq.remove(streamKey);
-            streamLastActiveTime.remove(streamKey);
-            httpStreams.remove(streamKey);
-            return;
-        }
-
-        // 原有处理逻辑
-        HttpResponseData httpResponseData = saveCompleteResponse(streamKey);
-        if (interceptors != null) {
-            for (PacketInterceptor interceptor : interceptors) {
-                interceptor.afterHandle(httpResponseData, info, packet);
-            }
-        }
-        // 清理流数据
-        httpResponseStreams.remove(streamKey);
-        streamExpectedSeq.remove(streamKey);
-        streamLastActiveTime.remove(streamKey);
-        httpStreams.remove(streamKey);
-        log.debug("[FIN] 流处理完成并清理: {}", streamKey);
-    }
 
     /**
      * 更新预期的下一个序列号
@@ -338,7 +309,6 @@ public class HttpPacketListener implements PacketListener {
 
         return uActual - uExpected;
     }
-
 
 
     /**
@@ -601,5 +571,35 @@ public class HttpPacketListener implements PacketListener {
         // 标记流为已完成，但不立即清理，等待FIN包进行最终清理
         httpStreams.remove(streamKey + "_active"); // 使用特殊标记表示响应已完成
         log.debug("[HTTP] 响应已完成并处理: {}", streamKey);
+    }
+
+    /**
+     * 处理FIN包(TCP连接关闭)
+     */
+    private void handleFinPacket(String streamKey, SimplePacketInfo info, Packet packet) {
+        // 如果响应已经处理过，只进行清理
+        if (!httpStreams.contains(streamKey + "_active")) {
+            log.debug("[FIN] 流已完成响应处理，仅进行清理: {}", streamKey);
+            // 清理流数据
+            httpResponseStreams.remove(streamKey);
+            streamExpectedSeq.remove(streamKey);
+            streamLastActiveTime.remove(streamKey);
+            httpStreams.remove(streamKey);
+            return;
+        }
+
+        // 原有处理逻辑
+        HttpResponseData httpResponseData = saveCompleteResponse(streamKey);
+        if (interceptors != null) {
+            for (PacketInterceptor interceptor : interceptors) {
+                interceptor.afterHandle(httpResponseData, info, packet);
+            }
+        }
+        // 清理流数据
+        httpResponseStreams.remove(streamKey);
+        streamExpectedSeq.remove(streamKey);
+        streamLastActiveTime.remove(streamKey);
+        httpStreams.remove(streamKey);
+        log.debug("[FIN] 流处理完成并清理: {}", streamKey);
     }
 }
