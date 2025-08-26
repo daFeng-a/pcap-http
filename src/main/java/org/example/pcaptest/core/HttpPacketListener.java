@@ -44,6 +44,10 @@ public class HttpPacketListener implements PacketListener {
     private final Map<String, Integer> responseExpectedLength = new ConcurrentHashMap<>();
     private final Map<String, Integer> responseCurrentLength = new ConcurrentHashMap<>();
 
+    // 记录请求/响应是否已处理（避免重复处理）
+    private final Map<String, Boolean> requestProcessed = new ConcurrentHashMap<>();
+    private final Map<String, Boolean> responseProcessed = new ConcurrentHashMap<>();
+
     // 存储HTTP流的StreamKey
     private final Set<String> httpStreams = ConcurrentHashMap.newKeySet();
 
@@ -750,53 +754,92 @@ public class HttpPacketListener implements PacketListener {
 
 
     /**
-     * 处理FIN包(TCP连接关闭)
+     * 处理FIN包（流结束标记）
      */
     private void handleFinPacket(String streamKey, SimplePacketInfo info, Packet packet, boolean isRequest) {
+        log.debug("[FIN] 收到流结束标记: {} (是否请求: {})", streamKey, isRequest);
+
         if (isRequest) {
-            // 处理请求流结束
-            HttpRequestData httpRequestData = saveCompleteRequest(streamKey);
-            if (interceptors != null) {
-                for (HttpPacketInterceptor interceptor : interceptors) {
-                    interceptor.onRequestComplete(httpRequestData, info, packet);
+            // 检查请求是否已处理
+            if (Boolean.TRUE.equals(requestProcessed.get(streamKey))) {
+                log.debug("[FIN] 请求流{}已处理，跳过FIN包二次处理", streamKey);
+                // 清理流数据
+                httpRequestStreams.remove(streamKey);
+                requestExpectedSeq.remove(streamKey);
+                requestLastActiveTime.remove(streamKey);
+                requestProcessed.remove(streamKey);
+                return;
+            }
+
+            // 处理未完成的请求
+            SortedMap<Long, byte[]> packets = httpRequestStreams.get(streamKey);
+            if (packets != null && !packets.isEmpty()) {
+                byte[] reassembled = reassembleTcpStream(packets);
+                if (isHttpRequestComplete(reassembled)) {
+                    handleCompleteRequest(streamKey, info, packet);
+                } else {
+                    log.warn("[FIN] 请求流{}未完成，但收到FIN包，强制处理", streamKey);
+                    // 强制处理不完整的请求（可选逻辑，根据业务需求调整）
+                    HttpRequestData httpRequestData = saveCompleteRequest(streamKey);
+                    if (interceptors != null) {
+                        for (HttpPacketInterceptor interceptor : interceptors) {
+                            interceptor.onRequestComplete(httpRequestData, info, packet);
+                        }
+                    }
+                    requestProcessed.put(streamKey, true);
                 }
             }
-            // 清理请求流数据
+
+            // 清理请求流资源
             httpRequestStreams.remove(streamKey);
             requestExpectedSeq.remove(streamKey);
             requestLastActiveTime.remove(streamKey);
-
-            // 清理响应相关的缓存（如果存在）
-            responseExpectedLength.remove(streamKey);
-            responseCurrentLength.remove(streamKey);
+            requestProcessed.remove(streamKey);
+            log.debug("[FIN] 清理请求流资源: {}", streamKey);
         } else {
-            // 处理响应流结束 - 强制检查响应完整性
+            // 检查响应是否已处理
+            if (Boolean.TRUE.equals(responseProcessed.get(streamKey))) {
+                log.debug("[FIN] 响应流{}已处理，跳过FIN包二次处理", streamKey);
+                // 清理流数据
+                httpResponseStreams.remove(streamKey);
+                responseExpectedSeq.remove(streamKey);
+                responseLastActiveTime.remove(streamKey);
+                responseExpectedLength.remove(streamKey);
+                responseCurrentLength.remove(streamKey);
+                responseProcessed.remove(streamKey);
+                return;
+            }
+
+            // 处理未完成的响应
             SortedMap<Long, byte[]> packets = httpResponseStreams.get(streamKey);
             if (packets != null && !packets.isEmpty()) {
                 byte[] reassembled = reassembleTcpStream(packets);
                 if (isHttpResponseComplete(reassembled)) {
+                    handleCompleteResponse(streamKey, info, packet);
+                } else {
+                    log.warn("[FIN] 响应流{}未完成，但收到FIN包，强制处理", streamKey);
+                    // 强制处理不完整的响应（可选逻辑，根据业务需求调整）
                     HttpResponseData httpResponseData = saveCompleteResponse(streamKey);
                     if (interceptors != null) {
                         for (HttpPacketInterceptor interceptor : interceptors) {
                             interceptor.onResponseComplete(httpResponseData, info, packet);
                         }
                     }
-                } else {
-                    log.warn("[FIN] 响应流结束但数据不完整: {}", streamKey);
+                    responseProcessed.put(streamKey, true);
                 }
             }
 
-            // 清理响应流数据
+            // 清理响应流资源
             httpResponseStreams.remove(streamKey);
             responseExpectedSeq.remove(streamKey);
             responseLastActiveTime.remove(streamKey);
-
-            // 清理响应相关的缓存
             responseExpectedLength.remove(streamKey);
             responseCurrentLength.remove(streamKey);
+            responseProcessed.remove(streamKey);
+            log.debug("[FIN] 清理响应流资源: {}", streamKey);
         }
-        log.debug("[FIN] 流处理完成并清理: {}", streamKey);
     }
+
     /**
      * 重组并生成完整的HTTP请求
      */
@@ -872,12 +915,20 @@ public class HttpPacketListener implements PacketListener {
      * 处理完整的HTTP请求
      */
     private void handleCompleteRequest(String streamKey, SimplePacketInfo info, Packet packet) {
+        // 检查是否已处理，避免重复
+        if (Boolean.TRUE.equals(requestProcessed.get(streamKey))) {
+            log.debug("[HTTP] 请求已处理，跳过重复处理: {}", streamKey);
+            return;
+        }
+
         HttpRequestData httpRequestData = saveCompleteRequest(streamKey);
         if (interceptors != null) {
             for (HttpPacketInterceptor interceptor : interceptors) {
                 interceptor.onRequestComplete(httpRequestData, info, packet);
             }
         }
+        // 标记为已处理
+        requestProcessed.put(streamKey, true);
         log.debug("[HTTP] 请求已完成并处理: {}", streamKey);
     }
 
@@ -885,15 +936,22 @@ public class HttpPacketListener implements PacketListener {
      * 处理完整的HTTP响应
      */
     private void handleCompleteResponse(String streamKey, SimplePacketInfo info, Packet packet) {
+        // 检查是否已处理，避免重复
+        if (Boolean.TRUE.equals(responseProcessed.get(streamKey))) {
+            log.debug("[HTTP] 响应已处理，跳过重复处理: {}", streamKey);
+            return;
+        }
+
         HttpResponseData httpResponseData = saveCompleteResponse(streamKey);
         if (interceptors != null) {
             for (HttpPacketInterceptor interceptor : interceptors) {
                 interceptor.onResponseComplete(httpResponseData, info, packet);
             }
         }
+        // 标记为已处理
+        responseProcessed.put(streamKey, true);
         log.debug("[HTTP] 响应已完成并处理: {}", streamKey);
     }
-
     // 新增方法：检查最后几个包是否包含分块结束标记
     private boolean hasChunkedEndMarker(SortedMap<Long, byte[]> packets) {
         if (packets.isEmpty()) return false;
