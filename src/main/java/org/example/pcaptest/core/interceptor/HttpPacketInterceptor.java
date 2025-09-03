@@ -20,10 +20,16 @@ public interface HttpPacketInterceptor {
         return true;
     }
 
+    /**
+     * 请求数据包处理完成后置处理
+     * @param requestData
+     * @param info
+     * @param packet
+     */
     void onRequestComplete(HttpRequestData requestData, SimplePacketInfo info, Packet packet);
 
     /**
-     * 后置处理
+     * 响应数据包后置处理
      * @param httpResponseData
      * @param simplePacketInfo
      * @param packet
